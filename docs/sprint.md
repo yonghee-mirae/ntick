@@ -34,6 +34,7 @@ PM이 Tech Lead·QA 의견을 받아 정했다. 작업 트리를 모든 팀원�
 - 커밋 게이트: 모든 팀원 idle 확인 → `gofmt -l .` 비어 있음 → `go mod tidy` 후 diff 없음 → `go vet ./...` → `go test -count=1 ./...`. ingest, query, store, stream, 스키마를 건드린 커밋은 `scripts/e2e.sh` 1회 추가. 게이트 직후와 커밋 직전의 `git status`/diff가 같은지 확인한다.
 - 태그 게이트(`sprint-N`): PO 승인 후, 다른 작업을 멈춘 상태에서 `go test -race ./...`, `e2e.sh` 3회, `e2e.sh --kill9` 1회, `fault.sh all` 1회(약 6~7분). 출력 마지막 줄(`E2E PASS`, `RESULT ... PASS`, `0 mismatches`)까지 확인한다.
 - 커밋 금지: `data/`, `*.db*`, 바이너리, `truth.csv`, 성능 시험 임시 데이터, 비밀값. 커밋 직전 `git status -uall`로 새로 추적될 파일을 눈으로 확인한다. 의존성 추가는 Tech Lead만 하며 `go.mod`/`go.sum`은 커밋하고 vendoring은 쓰지 않는다.
+- 이력: `baseline`(태그) = `83b7a87`. 계층별 6개 커밋으로 나눈 재구성 이관이며 전체 트리만 검증했다(`gofmt`, `go mod tidy`, `go vet`, `go test -race`, e2e 3회, kill9, `fault.sh all` 8/8). `origin/main` 동기화와 신규 clone의 `go vet`·`go test` 통과를 확인했다.
 - 하네스(`scripts`, `tclient`) 변경은 변조 시험(mutation) 1회로 실제 불일치를 잡는지 확인한 뒤 커밋한다.
 - 위험과 완화: worktree로 공유 트리의 간섭(반쯤 수정된 파일, 서로의 시험 방해)은 사라지지만 병합 충돌이 생긴다. 파일 소유 구역을 유지하고, `go.mod`/`go.sum`은 Tech Lead 브랜치에서만 바꾸며, 공유 파일(`cmd/ntick/main.go`, 문서)은 한 스프린트에 한 브랜치만 수정한다. 충돌은 PM이 병합 때 해결하고 병합 후 `main`에서 게이트를 다시 통과시킨다. 성능 측정은 다른 브랜치 작업이 없는 조용한 시간에만 한다. 각 팀원의 완료 보고는 자기 브랜치에서 `go vet`·`go test`를 통과시킨 뒤에 한다.
 
@@ -192,6 +193,21 @@ PM이 Tech Lead·QA 의견을 받아 정했다. 작업 트리를 모든 팀원�
     - 핵심 수치(i5-10400 6C/12T, NVMe): 수집 steady 5종목 478k, 100종목 275k, 500종목 79k, **2000종목 1.1k tick/s**(LRU pool 절벽, pool 256이면 26k). n-tick 조회 행당 약 890 ns, m·n 100 ms≈105k, 500 ms≈550k, 2 s≈2.2M, **현 상한 10M행은 9 s(warm)·16 s(cold)**. modernc는 동시 조회 2개에서 포화하고 수집을 최대 -63% 깎음(mattn은 8개에서 5.1배). 신규 일자 파일 생성 48 files/s. 실시간 commit→수신 p99 < 1 ms, 종단 p99 30~60 ms(flush 50 ms). 저장 36.8 B/틱(인덱스 제거 시 23.1), 3000종목×250일≈1.38 TB(추정)
     - PM 검토: 보고서를 끝까지 읽었고 권고(목표치 제안, 캐시 보류, 드라이버, 상수, `day_index`, 보관)를 PO 결정 항목으로 정리함. 수치는 PM이 재현하지 않았음(측정은 PM이 직접 돌리지 않음)
   - [x] README, `docs/architecture.md` 갱신 (PM)
+
+### Sprint 6 — 성능 개선 (제안, PO 결정 대기)
+
+`docs/perf-report.md` 기반 PM 제안이다. PO 결정이 필요한 항목이 정해지기 전에는 해당 작업을 시작하지 않는다.
+
+- PO 결정 필요
+  - P1. 요청 상한: 현재 `m ≤ 1,000`, `n ≤ 10,000`을 각각만 제한해 최대 10M행(warm 9 s, cold 16 s)을 읽는다. `m·n` 상한 도입 제안: 500,000(p95 500 ms, 현재 코드), 인덱스 처리 후 1,000,000
+  - P2. `ix_ticks_valid` 처리: 제거(저장 -37%, 수집 +48%, 조회 1.8배, 스키마·재판정 영향) / 쿼리에 `NOT INDEXED` 힌트(조회만 1.8배) / 유지
+  - P3. SQLite 드라이버: modernc 유지 + 질의 동시 2 제한 / mattn 전환(조회 동시성 5배, 다종목 수집 CPU 2배, cgo 필요)
+  - P4. 수집 목표: 활성 종목 수와 피크 tick/s 입력 필요. 제안은 활성 3000종목 합계 20k tick/s. 달성하려면 pool 256 이상과 `ulimit -n` 약 10,000 이상 필요
+  - P5. 실시간 목표: p99 ≤ 100 ms 제안(flush 50 → 20 ms)
+  - P6. 구독자 상한: 프로세스당 500, 초과 시 HTTP 503 제안
+  - P7. 보관 기간(일자 디렉터리 삭제 단위), P8. 캐시(PRD 5.4)는 P1 결정에 따라 보류 유지 제안
+- PO 결정과 무관하게 진행 가능(PM 판단): 스키마 생성을 단일 트랜잭션으로(신규 일자 파일 48 → 93 files/s), `cache_size` 축소(열린 파일당 메모리 4 MB), 느린 구독자 종료 시 close 프레임·사유 전달 보장
+- 진행 방식: 팀원별 브랜치·worktree, 병합과 태그는 PM
 
 ## 결정 기록
 
