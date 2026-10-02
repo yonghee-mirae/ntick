@@ -1,0 +1,11 @@
+# runtime data and generated files
+/data/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.db.tmp
+truth.csv
+
+# build output
+/bin/
