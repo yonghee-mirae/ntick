@@ -194,6 +194,16 @@ PM이 Tech Lead·QA 의견을 받아 정했다. 작업 트리를 모든 팀원�
     - PM 검토: 보고서를 끝까지 읽었고 권고(목표치 제안, 캐시 보류, 드라이버, 상수, `day_index`, 보관)를 PO 결정 항목으로 정리함. 수치는 PM이 재현하지 않았음(측정은 PM이 직접 돌리지 않음)
   - [x] README, `docs/architecture.md` 갱신 (PM)
 
+### 저장 구조 비교 측정 (PO 요청, 완료, PO 리뷰 대기)
+
+- 결과 요약(`docs/perf-storage-modes.md`, 균등 분포·steady·1M tick 중앙값, tick/s): 활성 100종목 A 튜닝 476k, B 87k~142k, C 993k(저장 상한)/715k(라우터 포함). 500종목 A 튜닝 146k, B 20k~74k, C는 메모리로 측정 불가(프로세스당 RSS 16~18 MB, 500개 약 8.7 GB·2000개 약 35 GB는 추정). 2000종목 A 현재 1.5k, A 튜닝 47k, B 22k~40k. B는 한 번에 한 writer만 쓰고 모든 종목이 같이 멈추며, 종목별 n-tick 조회가 2.1배 느림(83.5 ms 대 39.7 ms). PM 검토: 브랜치 diff에 제품 코드 변경 없음, `gofmt`·`go vet`·`go test` 통과. 수치는 PM이 재현하지 않음
+- 병합: `perf/s6-storage-modes`를 `main`에 `--no-ff`로 병합
+
+- 요청: 저장 구조 3가지의 쓰기 성능 비교. A) 단일 프로세스가 종목별 db 파일로 분기(현재 구조), B) 단일 프로세스가 하나의 db 파일에 모든 종목 기록, C) 종목별 저장 프로세스가 각자 종목별 db 파일에 기록
+- 담당: Performance Engineer, 브랜치 `perf/s6-storage-modes`, worktree `../ntick-wt/perf` (git 개정 원칙 첫 적용)
+- PM 설계: 같은 PRAGMA·배치·트랜잭션 내용으로 비교. A는 현재 설정과 튜닝 설정(풀 확대, `cache_size` 축소, 배치 2000) 둘 다. B는 종목별 조회 기능을 유지하도록 `(symbol_id, raw_seq)` 인덱스를 포함한 스키마(쓰기 비용 포함). C는 메모리 제약(RAM 7.6 GiB)으로 실현 가능한 종목 수까지만 측정하고 프로세스당 RSS를 실측해 2000·3000 프로세스 필요 메모리를 추정(추정 표시), 입력은 저장 계층 상한(C-a)과 라우터 분배 포함(C-b) 두 가지. 종목 5·100·500·2000, 균등 분포와 종목 편중 분포(100·500), 1M tick 이상 3회 반복, cold·steady 구분. 부가로 조회 영향 1표(종목별 n-tick 지연)
+- 산출물: `docs/perf-storage-modes.md`. 이 측정은 Sprint 6 결정(P3 드라이버, 수집 목표)과 구조 선택의 근거가 된다
+
 ### Sprint 6 — 성능 개선 (제안, PO 결정 대기)
 
 `docs/perf-report.md` 기반 PM 제안이다. PO 결정이 필요한 항목이 정해지기 전에는 해당 작업을 시작하지 않는다.
