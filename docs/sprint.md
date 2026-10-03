@@ -28,7 +28,8 @@ PM이 Tech Lead·QA 의견을 받아 정했다. 작업 트리를 모든 팀원�
 - 실행 주체 (v2, PO 지시 2026-10-02에 따라 개정): PM은 `main`의 병합·태그·게이트를 맡는다. 팀원 에이전트는 PM이 만들어 준 자신의 worktree와 브랜치 안에서만 `add`/`commit`을 실행한다. `checkout`, `stash`, `reset`, `rebase`, `merge`, `push`, 강제 옵션, 다른 worktree 접근은 금지한다(`push`는 PM만 실행한다). 전역 지침(직접 git 실행 금지)의 이 프로젝트 한정 예외다. 적용 시점은 `baseline` 커밋 이후의 작업부터이며, 그 전 작업은 공유 작업 트리에서 진행되었다.
 - 브랜치와 태그: `main`은 항상 게이트를 통과한 상태로 둔다. 팀원 브랜치는 `<역할>/s<N>-<주제>`(예: `ingest/s6-cache`), worktree는 `../ntick-wt/<역할>`이며 PM이 `main`에서 만들어 준다. 작업이 끝나면 PM이 diff를 검토(시험을 약화시킨 변경 여부 포함)하고 의존 순서대로 `--no-ff`로 병합한다. 승인된 스프린트마다 태그 `sprint-N`, 초기 이관은 `baseline`.
 - 원격 동기화(PO 승인 2026-10-02, 이 프로젝트 한정): `origin`은 `https://github.com/yonghee-mirae/ntick.git`. PO가 다른 PC에서 결과물을 확인하므로 원격을 항상 최신으로 충실히 유지한다. PM이 다음 시점에 push한다: ① `main` 병합 직후 ② 태그 생성 직후(`git push origin <tag>`로 명시) ③ 팀원 브랜치 작업이 끝나 병합 검토를 시작할 때(브랜치 push) ④ 스프린트 보고 직전. 결과물 보고는 push 완료 후에만 한다. push 후 `git fetch origin`과 `git status -sb`로 ahead/behind가 0인지, `git ls-remote origin`의 `main`·태그 SHA가 로컬과 같은지 확인하고 PO 보고에 커밋 SHA를 적는다. push 전에는 `git status -uall`과 비밀값 점검을 한다.
-- 원격 금지 사항: force push, 원격 히스토리 재작성, 원격 브랜치·태그 삭제(PO가 요청한 경우 제외). 인증 실패나 원격 거부가 나면 우회하지 않고 PO에게 알린다.
+- 브랜치 정리(PO 승인 2026-10-03): 용도가 다한 브랜치는 PM이 판단해 정리한다. 조건은 `main`에 병합이 확인된 팀원 브랜치(`git merge-base --is-ancestor`)이며, 병합 직후 worktree 제거, 로컬 `git branch -d`(미병합이면 거부됨), 원격 브랜치 삭제 순서로 한다. 이후 작업은 새 브랜치로 시작한다. 병합되지 않은 브랜치와 `main`, 태그는 삭제하지 않는다. 어떤 커밋이 어느 브랜치에서 왔는지는 `--no-ff` 병합 커밋 메시지로 추적한다.
+- 원격 금지 사항: force push, 원격 히스토리 재작성, `main`·태그와 병합되지 않은 브랜치의 삭제(PO가 요청한 경우 제외). 인증 실패나 원격 거부가 나면 우회하지 않고 PO에게 알린다. push 전에는 `git fetch`로 PO가 원격에 올린 새 커밋이 있는지 확인하고 먼저 반영한다.
 - 커밋 단위: 한 커밋 한 목적. 제품 코드는 패키지(담당 영역)별, 문서는 코드와 분리한다. 시험 기대값·하네스(`oracle`, `tclient`, `scripts`)는 제품 코드와 분리해 커밋하고 변경 이유를 적는다(시험을 약화시킨 변경이 섞이는 것을 막는다).
 - 메시지: Conventional Commits, scope는 패키지명, 영어 제목 72자 이내, 본문에 what/why와 통과한 검증 요약 한 줄, 하네스가 요구하는 트레일러. 환경 의존 수치는 커밋이 아니라 `docs/perf-report.md`에 둔다.
 - 커밋 게이트: 모든 팀원 idle 확인 → `gofmt -l .` 비어 있음 → `go mod tidy` 후 diff 없음 → `go vet ./...` → `go test -count=1 ./...`. ingest, query, store, stream, 스키마를 건드린 커밋은 `scripts/e2e.sh` 1회 추가. 게이트 직후와 커밋 직전의 `git status`/diff가 같은지 확인한다.
@@ -197,7 +198,7 @@ PM이 Tech Lead·QA 의견을 받아 정했다. 작업 트리를 모든 팀원�
 ### 저장 구조 비교 측정 (PO 요청, 완료, PO 리뷰 대기)
 
 - 결과 요약(`docs/perf-storage-modes.md`, 균등 분포·steady·1M tick 중앙값, tick/s): 활성 100종목 A 튜닝 476k, B 87k~142k, C 993k(저장 상한)/715k(라우터 포함). 500종목 A 튜닝 146k, B 20k~74k, C는 메모리로 측정 불가(프로세스당 RSS 16~18 MB, 500개 약 8.7 GB·2000개 약 35 GB는 추정). 2000종목 A 현재 1.5k, A 튜닝 47k, B 22k~40k. B는 한 번에 한 writer만 쓰고 모든 종목이 같이 멈추며, 종목별 n-tick 조회가 2.1배 느림(83.5 ms 대 39.7 ms). PM 검토: 브랜치 diff에 제품 코드 변경 없음, `gofmt`·`go vet`·`go test` 통과. 수치는 PM이 재현하지 않음
-- 병합: `perf/s6-storage-modes`를 `main`에 `--no-ff`로 병합
+- 병합: `perf/s6-storage-modes`를 `main`에 `--no-ff`로 병합(`c9cb529`). 이후 worktree와 로컬·원격 브랜치를 정리함(2026-10-03)
 
 - 요청: 저장 구조 3가지의 쓰기 성능 비교. A) 단일 프로세스가 종목별 db 파일로 분기(현재 구조), B) 단일 프로세스가 하나의 db 파일에 모든 종목 기록, C) 종목별 저장 프로세스가 각자 종목별 db 파일에 기록
 - 담당: Performance Engineer, 브랜치 `perf/s6-storage-modes`, worktree `../ntick-wt/perf` (git 개정 원칙 첫 적용)
@@ -254,3 +255,4 @@ PM이 Tech Lead·QA 의견을 받아 정했다. 작업 트리를 모든 팀원�
 | 2026-10-02 | git 운영 원칙은 PM이 팀과 상의해 정함. PM이 로컬 커밋·태그를 직접 실행(전역 지침의 이 프로젝트 한정 예외), push·되돌리기 어려운 작업 금지 | PO |
 | 2026-10-02 | (개정) PO의 제안에 따라 팀원별 브랜치·worktree로 작업하고 각자 자기 브랜치에 커밋, PM이 검토 후 병합·태그. `baseline` 이후 작업부터 적용 | PO 제안, PM |
 | 2026-10-02 | 원격 저장소 `origin`(github.com/yonghee-mirae/ntick)을 이 프로젝트 한정으로 자유롭게 활용(push 포함). PO가 다른 PC에서 확인할 수 있게 결과물을 충실히 동기화 | PO |
+| 2026-10-03 | 용도가 다한 브랜치(병합 확인된 팀원 브랜치)의 worktree·로컬·원격 정리를 PM이 판단해 수행 | PO |
