@@ -9,3 +9,7 @@ truth.csv
 
 # build output
 /bin/
+
+# macOS
+._*
+.DS_Store
