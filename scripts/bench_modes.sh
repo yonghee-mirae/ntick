@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Write-path comparison of three storage layouts (docs/perf-storage-modes.md).
-# Usage: scripts/bench_modes.sh MATRIX   (matrix = a | b | c | skew | read | all)
+# Usage: scripts/bench_modes.sh MATRIX   (matrix = a | b | c | skew | ready | read | all)
 # Env: WORK (scratch dir, never inside the repo), REPS (default 3), TICKS (default 1000000)
 # Output: one "LABEL RESULT ..." line per run on stdout. Aggregate with scripts/bench_modes_sum.py.
 set -uo pipefail
@@ -50,6 +50,12 @@ case ${1:-all} in
        run "C-b-zipf" -mode C-b -syms 100 -ticks $TICKS -phase $ph -dist zipf; done
      REPS=1 run "C-a" -mode C-a -syms 300 -ticks $TICKS -phase steady
      REPS=1 run "C-b" -mode C-b -syms 300 -ticks $TICKS -phase steady ;;
+  ready) # hash-fixed vs ready-queue dispatch (docs/perf-ready-queue.md)
+     for di in uniform zipf; do for s in 100 500; do
+       run "A-tuned-$di-$s" -mode A-tuned -syms $s -ticks $TICKS -phase steady -dist $di $A_TUNED
+       run "A-ready-$di-$s" -mode A-ready -syms $s -ticks $TICKS -phase steady -dist $di $A_TUNED
+       run "A-ready-mb200-$di-$s" -mode A-ready -minbatch 200 -syms $s -ticks $TICKS -phase steady -dist $di $A_TUNED
+     done; done ;;
   read) # same data (100 symbols, 5M ticks): A layout vs B layout, one symbol, warm
      rm -rf "$WORK/dsA" "$WORK/dsB"
      "$BIN" modes-run -mode A-tuned -syms 100 -ticks 5000000 -dir "$WORK/dsA" -keep $A_TUNED | head -1

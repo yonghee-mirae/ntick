@@ -227,6 +227,7 @@ type wcfg struct {
 	cacheKB int // 0 = SQLite default
 	dir     string
 	names   []string // symbol names by index
+	shared  *dbCache // A-ready: DB handles shared by all writers (nil = per-writer pool)
 }
 
 func createTuned(path string, cacheKB int) (*sql.DB, error) {
@@ -270,6 +271,7 @@ type fwriter struct {
 	wg       sync.WaitGroup
 	opens    int
 	openTime time.Duration
+	busy     time.Duration // time spent inside write
 }
 
 type pent struct {
@@ -329,11 +331,15 @@ func (w *fwriter) commit(batch []mtick) {
 			w.err = err
 		}
 		w.lat = append(w.lat, int32(time.Since(t0).Microseconds()))
+		w.busy += time.Since(t0)
 		w.sizes = append(w.sizes, int32(len(groups[s])))
 	}
 }
 
 func (w *fwriter) open(sym int32) (*sql.DB, error) {
+	if w.cfg.shared != nil {
+		return w.cfg.shared.get(w.cfg, sym)
+	}
 	if e, ok := w.pool[sym]; ok {
 		w.lru.MoveToFront(e)
 		return e.Value.(*pent).db, nil
@@ -599,6 +605,7 @@ type runCfg struct {
 	syms, ticks, batch     int
 	flushMS, cacheKB       int
 	workers, pool          int
+	minBatch               int
 	keep                   bool
 }
 
@@ -615,6 +622,7 @@ func modesRun(args []string) {
 	fs.IntVar(&c.flushMS, "flush", 50, "flush ms")
 	fs.IntVar(&c.cacheKB, "cache", 0, "cache_size KB (0 = default)")
 	fs.IntVar(&c.workers, "workers", 12, "workers (A)")
+	fs.IntVar(&c.minBatch, "minbatch", 1, "min queued ticks before a symbol becomes ready (A-ready); a sweeper still schedules older data every -flush ms")
 	fs.IntVar(&c.pool, "pool", 64, "per-worker pool (A); 0 = unlimited")
 	fs.BoolVar(&c.keep, "keep", false, "keep data dir")
 	fs.Parse(args)
@@ -636,7 +644,7 @@ func modesRun(args []string) {
 		return
 	}
 	ticks := genTicks(c.syms, c.ticks, c.dist)
-	wcfg := wcfg{batch: c.batch, flush: time.Duration(c.flushMS) * time.Millisecond, pool: c.pool, tuned: c.mode == "A-tuned", cacheKB: c.cacheKB, dir: c.dir, names: names}
+	wcfg := wcfg{batch: c.batch, flush: time.Duration(c.flushMS) * time.Millisecond, pool: c.pool, tuned: c.mode == "A-tuned" || c.mode == "A-ready", cacheKB: c.cacheKB, dir: c.dir, names: names}
 	if wcfg.pool == 0 {
 		wcfg.pool = 1 << 30
 	}
@@ -677,6 +685,10 @@ func modesRun(args []string) {
 			in.Close()
 			return nil, nil, 0, nil
 		}
+	case c.mode == "A-ready":
+		run = func(feed func(put func(mtick))) ([]int32, []int32, int, error) {
+			return runReady(c, wcfg, feed)
+		}
 	case strings.HasPrefix(c.mode, "A-"):
 		run = func(feed func(put func(mtick))) ([]int32, []int32, int, error) {
 			ws := make([]*fwriter, c.workers)
@@ -697,8 +709,10 @@ func modesRun(args []string) {
 			for _, w := range ws {
 				close(w.ch)
 			}
+			gBusy = gBusy[:0]
 			for _, w := range ws {
 				w.wg.Wait()
+				gBusy = append(gBusy, w.busy)
 				lat, sizes, opens = append(lat, w.lat...), append(sizes, w.sizes...), opens+w.opens
 				if w.err != nil {
 					err = w.err
@@ -760,10 +774,10 @@ func modesRun(args []string) {
 		avg /= float64(len(sizes))
 	}
 	wal := dirBytes(c.dir) // after Close: WAL folded into db (peak WAL measured separately via ls)
-	fmt.Printf("RESULT mode=%s syms=%d dist=%s phase=%s ticks=%d batch=%d secs=%.3f rate=%.0f cpu_pct=%.0f rss_net_mb=%.0f fd_max=%d thr_max=%d commits=%d avg_ticks_per_commit=%.1f lat_p50_ms=%.2f lat_p99_ms=%.2f lat_mean_ms=%.2f opens=%d disk_bytes_per_tick=%.1f peak_disk_mb=%.0f io_write_bytes_per_tick=%.1f warm_s=%.1f\n",
+	fmt.Printf("RESULT mode=%s syms=%d dist=%s phase=%s ticks=%d batch=%d secs=%.3f rate=%.0f cpu_pct=%.0f rss_net_mb=%.0f fd_max=%d thr_max=%d commits=%d avg_ticks_per_commit=%.1f lat_p50_ms=%.2f lat_p99_ms=%.2f lat_mean_ms=%.2f opens=%d disk_bytes_per_tick=%.1f peak_disk_mb=%.0f io_write_bytes_per_tick=%.1f warm_s=%.1f%s\n",
 		c.mode, c.syms, c.dist, c.phase, c.ticks, c.batch, secs, float64(c.ticks)/secs, cpu/secs*100,
 		float64(procStatusKB("VmHWM")-rss0)/1024, smp.maxFD.Load(), smp.maxThr.Load(), len(sizes), avg,
-		pctl(append([]int32(nil), lat...), .5), pctl(lat, .99), meanMS(lat), opens, float64(wal)/float64(c.ticks), float64(peakDir.Load())/1e6, float64(wbytes)/float64(c.ticks), warmSecs)
+		pctl(append([]int32(nil), lat...), .5), pctl(lat, .99), meanMS(lat), opens, float64(wal)/float64(c.ticks), float64(peakDir.Load())/1e6, float64(wbytes)/float64(c.ticks), warmSecs, busyStr(secs))
 }
 
 // ---- mode C: one writer process per symbol ----
