@@ -67,6 +67,7 @@ var (
 type mtick struct {
 	sym            int32
 	ts, price, qty int64
+	at             int64 // arrival time (UnixNano), set only in paced runs for end-to-end latency
 }
 
 func symName(i int) string { return "S" + strconv.Itoa(100000+i) }
@@ -96,7 +97,7 @@ func genTicks(syms, n int, dist string) []mtick {
 				s = syms - 1
 			}
 		}
-		out[i] = mtick{int32(s), mBase + int64(i)*21600000/int64(n), 10000 + int64((i*7+s*13)%5000), 1 + int64(i%997)}
+		out[i] = mtick{int32(s), mBase + int64(i)*21600000/int64(n), 10000 + int64((i*7+s*13)%5000), 1 + int64(i%997), 0}
 	}
 	return out
 }
@@ -272,6 +273,7 @@ type fwriter struct {
 	opens    int
 	openTime time.Duration
 	busy     time.Duration // time spent inside write
+	e2e      []int32       // per-tick arrival-to-commit latency in us (paced runs)
 }
 
 type pent struct {
@@ -332,6 +334,7 @@ func (w *fwriter) commit(batch []mtick) {
 		}
 		w.lat = append(w.lat, int32(time.Since(t0).Microseconds()))
 		w.busy += time.Since(t0)
+		w.stampE2E(groups[s])
 		w.sizes = append(w.sizes, int32(len(groups[s])))
 	}
 }
@@ -606,6 +609,7 @@ type runCfg struct {
 	flushMS, cacheKB       int
 	workers, pool          int
 	minBatch               int
+	rate                   int // paced input, ticks/s (0 = unpaced)
 	keep                   bool
 }
 
@@ -623,6 +627,7 @@ func modesRun(args []string) {
 	fs.IntVar(&c.cacheKB, "cache", 0, "cache_size KB (0 = default)")
 	fs.IntVar(&c.workers, "workers", 12, "workers (A)")
 	fs.IntVar(&c.minBatch, "minbatch", 1, "min queued ticks before a symbol becomes ready (A-ready); a sweeper still schedules older data every -flush ms")
+	fs.IntVar(&c.rate, "rate", 0, "paced input ticks/s for the measured phase (0 = as fast as possible); also records end-to-end latency")
 	fs.IntVar(&c.pool, "pool", 64, "per-worker pool (A); 0 = unlimited")
 	fs.BoolVar(&c.keep, "keep", false, "keep data dir")
 	fs.Parse(args)
@@ -651,7 +656,7 @@ func modesRun(args []string) {
 	// warm pass for steady: one tick per symbol, slightly earlier than the measured input
 	warm := func(put func(mtick)) {
 		for s := 0; s < c.syms; s++ {
-			put(mtick{int32(s), mBase - 1000, 10000, 1})
+			put(mtick{int32(s), mBase - 1000, 10000, 1, 0})
 		}
 	}
 	rss0 := procStatusKB("VmRSS")
@@ -709,10 +714,10 @@ func modesRun(args []string) {
 			for _, w := range ws {
 				close(w.ch)
 			}
-			gBusy = gBusy[:0]
+			gBusy, gE2E = gBusy[:0], gE2E[:0]
 			for _, w := range ws {
 				w.wg.Wait()
-				gBusy = append(gBusy, w.busy)
+				gBusy, gE2E = append(gBusy, w.busy), append(gE2E, w.e2e...)
 				lat, sizes, opens = append(lat, w.lat...), append(sizes, w.sizes...), opens+w.opens
 				if w.err != nil {
 					err = w.err
@@ -755,7 +760,22 @@ func modesRun(args []string) {
 	cpu0, io0 := selfCPU(), ioWriteBytes()
 	t0 := time.Now()
 	lat, sizes, opens, err := run(func(put func(mtick)) {
-		for _, t := range ticks {
+		t0 := time.Now()
+		for i, t := range ticks {
+			if c.rate > 0 {
+				if i%64 == 0 { // pace in small groups: sleep when far ahead, spin when close
+					for {
+						ahead := time.Duration(float64(i)/float64(c.rate)*1e9) - time.Since(t0)
+						if ahead <= 0 {
+							break
+						}
+						if ahead > 500*time.Microsecond {
+							time.Sleep(ahead - 200*time.Microsecond)
+						}
+					}
+				}
+				t.at = time.Now().UnixNano()
+			}
 			put(t)
 		}
 	})
@@ -1029,7 +1049,7 @@ func modesChild(args []string) {
 	cfg := wcfg{batch: *batch, flush: time.Duration(*flushMS) * time.Millisecond, pool: 1, tuned: *tuned, cacheKB: *cache, dir: *dir, names: []string{*name}}
 	var own []mtick
 	for k := 0; k < *n; k++ { // this symbol's own ticks, spread evenly over the same 6 h
-		own = append(own, mtick{0, mBase + int64(k)*21600000/int64(max(*n, 1)), 10000 + int64((k*7)%5000), 1 + int64(k%997)})
+		own = append(own, mtick{0, mBase + int64(k)*21600000/int64(max(*n, 1)), 10000 + int64((k*7)%5000), 1 + int64(k%997), 0})
 	}
 	in := bufio.NewReader(os.Stdin)
 	fmt.Println("READY")
@@ -1071,7 +1091,7 @@ func modesChild(args []string) {
 			}
 			cnt++
 			if !*discard {
-				w.ch <- mtick{0, m.Ts, m.Price, m.Qty}
+				w.ch <- mtick{0, m.Ts, m.Price, m.Qty, 0}
 			}
 		}
 	}

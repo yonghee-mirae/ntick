@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Write-path comparison of three storage layouts (docs/perf-storage-modes.md).
-# Usage: scripts/bench_modes.sh MATRIX   (matrix = a | b | c | skew | ready | read | all)
+# Usage: scripts/bench_modes.sh MATRIX   (matrix = a | b | c | skew | ready | paced | sat | read | all)
 # Env: WORK (scratch dir, never inside the repo), REPS (default 3), TICKS (default 1000000)
 # Output: one "LABEL RESULT ..." line per run on stdout. Aggregate with scripts/bench_modes_sum.py.
 set -uo pipefail
@@ -56,6 +56,21 @@ case ${1:-all} in
        run "A-ready-$di-$s" -mode A-ready -syms $s -ticks $TICKS -phase steady -dist $di $A_TUNED
        run "A-ready-mb200-$di-$s" -mode A-ready -minbatch 200 -syms $s -ticks $TICKS -phase steady -dist $di $A_TUNED
      done; done ;;
+  paced) # paced input (ticks/s), Zipf: dispatch policy vs CPU, commit size and end-to-end latency
+     for cell in "100 110000" "100 225000" "100 360000" "500 50000" "500 100000" "500 170000"; do set -- $cell
+       s=$1 r=$2; t=$((r * 6)); c="-syms $s -ticks $t -rate $r -phase steady -dist zipf $A_TUNED"
+       run "H-f50-$s-$r" -mode A-tuned $c -flush 50
+       run "H-f10-$s-$r" -mode A-tuned $c -flush 10
+       run "R1-$s-$r" -mode A-ready $c -minbatch 1
+       run "R200-T10-$s-$r" -mode A-ready $c -minbatch 200 -flush 10
+       run "R200-T50-$s-$r" -mode A-ready $c -minbatch 200 -flush 50
+       run "R50-T10-$s-$r" -mode A-ready $c -minbatch 50 -flush 10
+     done ;;
+  sat) # saturation anomaly: uniform 100, minbatch/sweep interval
+     for i in 1 2; do
+       run "sat-R1" -mode A-ready -syms 100 -ticks $TICKS -phase steady -dist uniform $A_TUNED -minbatch 1
+       for f in 10 20 50; do run "sat-R200-T$f" -mode A-ready -syms 100 -ticks $TICKS -phase steady -dist uniform $A_TUNED -minbatch 200 -flush $f; done
+     done ;;
   read) # same data (100 symbols, 5M ticks): A layout vs B layout, one symbol, warm
      rm -rf "$WORK/dsA" "$WORK/dsB"
      "$BIN" modes-run -mode A-tuned -syms 100 -ticks 5000000 -dir "$WORK/dsA" -keep $A_TUNED | head -1

@@ -18,8 +18,19 @@ import (
 // gBusy/gExtra carry per-run writer stats to the RESULT line (set by the A-* run closures).
 var (
 	gBusy  []time.Duration
+	gE2E   []int32
 	gExtra string
 )
+
+// stampE2E records arrival-to-commit latency for ticks that carry an arrival stamp (paced runs).
+func (w *fwriter) stampE2E(recs []mtick) {
+	now := time.Now().UnixNano()
+	for _, r := range recs {
+		if r.at != 0 {
+			w.e2e = append(w.e2e, int32((now-r.at)/1000))
+		}
+	}
+}
 
 // busyStr reports min/max writer busy ratio (time inside write / wall time): the imbalance measure.
 func busyStr(secs float64) string {
@@ -28,7 +39,11 @@ func busyStr(secs float64) string {
 	}
 	b := append([]time.Duration(nil), gBusy...)
 	sort.Slice(b, func(i, j int) bool { return b[i] < b[j] })
-	return fmt.Sprintf(" wbusy_min=%.2f wbusy_max=%.2f%s", b[0].Seconds()/secs, b[len(b)-1].Seconds()/secs, gExtra)
+	e := ""
+	if len(gE2E) > 0 {
+		e = fmt.Sprintf(" e2e_p50_ms=%.2f e2e_p99_ms=%.2f e2e_max_ms=%.2f", pctl(append([]int32(nil), gE2E...), .5), pctl(append([]int32(nil), gE2E...), .99), pctl(gE2E, 1))
+	}
+	return fmt.Sprintf(" wbusy_min=%.2f wbusy_max=%.2f%s%s", b[0].Seconds()/secs, b[len(b)-1].Seconds()/secs, e, gExtra)
 }
 
 type dbEnt struct {
@@ -167,6 +182,7 @@ func (r *readySched) work(w *fwriter, k int) {
 		w.lat = append(w.lat, int32(d.Microseconds()))
 		w.sizes = append(w.sizes, int32(n))
 		w.busy += d
+		w.stampE2E(buf)
 		q.mu.Lock() // release only after the commit; same lock as put, so no lost wakeup
 		if len(q.q) > 0 {
 			q.mu.Unlock()
@@ -203,10 +219,10 @@ func runReady(c runCfg, cfg wcfg, feed func(put func(mtick))) ([]int32, []int32,
 	cfg.shared.closeAll(c.workers)
 	var lat, sizes []int32
 	var err error
-	gBusy = gBusy[:0]
+	gBusy, gE2E = gBusy[:0], gE2E[:0]
 	for _, w := range ws {
 		lat, sizes = append(lat, w.lat...), append(sizes, w.sizes...)
-		gBusy = append(gBusy, w.busy)
+		gBusy, gE2E = append(gBusy, w.busy), append(gE2E, w.e2e...)
 		if w.err != nil {
 			err = w.err
 		}
