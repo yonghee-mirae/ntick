@@ -20,13 +20,15 @@ var (
 	gBusy  []time.Duration
 	gE2E   []int32
 	gExtra string
+
+	gSkipUntil atomic.Int64
 )
 
 // stampE2E records arrival-to-commit latency for ticks that carry an arrival stamp (paced runs).
 func (w *fwriter) stampE2E(recs []mtick) {
 	now := time.Now().UnixNano()
 	for _, r := range recs {
-		if r.at != 0 {
+		if r.at != 0 && r.at >= gSkipUntil.Load() {
 			w.e2e = append(w.e2e, int32((now-r.at)/1000))
 		}
 	}
@@ -233,4 +235,52 @@ func runReady(c runCfg, cfg wcfg, feed func(put func(mtick))) ([]int32, []int32,
 	}
 	gExtra = fmt.Sprintf(" order_viol=%d max_symq=%d", r.viol.Load(), maxQ)
 	return lat, sizes, 0, err
+}
+
+// runAcc is the hash-pinned alternative: per-symbol buffers inside the writer, a symbol is committed
+// when it holds minB ticks or at the next flush tick (so a tick waits at most one flush interval).
+func (w *fwriter) runAcc() {
+	bufs := map[int32][]mtick{}
+	tk := time.NewTicker(w.cfg.flush)
+	defer tk.Stop()
+	defer w.closeAll()
+	commitSym := func(s int32) {
+		b := bufs[s]
+		for len(b) > 0 {
+			n := min(len(b), w.cfg.batch)
+			t0 := time.Now()
+			if err := w.write(s, b[:n]); err != nil && w.err == nil {
+				w.err = err
+			}
+			d := time.Since(t0)
+			w.lat = append(w.lat, int32(d.Microseconds()))
+			w.sizes = append(w.sizes, int32(n))
+			w.busy += d
+			w.stampE2E(b[:n])
+			b = b[n:]
+		}
+		bufs[s] = bufs[s][:0]
+	}
+	flushAll := func() {
+		for s, b := range bufs {
+			if len(b) > 0 {
+				commitSym(s)
+			}
+		}
+	}
+	for {
+		select {
+		case t, ok := <-w.ch:
+			if !ok {
+				flushAll()
+				return
+			}
+			bufs[t.sym] = append(bufs[t.sym], t)
+			if len(bufs[t.sym]) >= w.cfg.minB {
+				commitSym(t.sym)
+			}
+		case <-tk.C:
+			flushAll()
+		}
+	}
 }

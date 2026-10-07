@@ -228,6 +228,8 @@ type wcfg struct {
 	cacheKB int // 0 = SQLite default
 	dir     string
 	names   []string // symbol names by index
+	acc     bool     // A-hacc: hash-pinned writer with per-symbol accumulation
+	minB    int      // A-hacc: commit a symbol once this many ticks are buffered
 	shared  *dbCache // A-ready: DB handles shared by all writers (nil = per-writer pool)
 }
 
@@ -251,6 +253,9 @@ func createTuned(path string, cacheKB int) (*sql.DB, error) {
 	dsn := store.DSN(path)
 	if cacheKB > 0 {
 		dsn += "&_pragma=cache_size(-" + strconv.Itoa(cacheKB) + ")"
+	}
+	if x := os.Getenv("NTICK_XPRAGMA"); x != "" { // diagnostics only, e.g. wal_autocheckpoint(0)
+		dsn += "&_pragma=" + x
 	}
 	db, err := sql.Open(store.Driver, dsn)
 	if err != nil {
@@ -291,6 +296,10 @@ func (w *fwriter) start() {
 }
 
 func (w *fwriter) run() {
+	if w.cfg.acc {
+		w.runAcc()
+		return
+	}
 	var batch []mtick
 	tk := time.NewTicker(w.cfg.flush)
 	defer tk.Stop()
@@ -609,7 +618,8 @@ type runCfg struct {
 	flushMS, cacheKB       int
 	workers, pool          int
 	minBatch               int
-	rate                   int // paced input, ticks/s (0 = unpaced)
+	skipSec                float64 // paced: ignore end-to-end samples from the first skipSec seconds
+	rate                   int     // paced input, ticks/s (0 = unpaced)
 	keep                   bool
 }
 
@@ -628,6 +638,7 @@ func modesRun(args []string) {
 	fs.IntVar(&c.workers, "workers", 12, "workers (A)")
 	fs.IntVar(&c.minBatch, "minbatch", 1, "min queued ticks before a symbol becomes ready (A-ready); a sweeper still schedules older data every -flush ms")
 	fs.IntVar(&c.rate, "rate", 0, "paced input ticks/s for the measured phase (0 = as fast as possible); also records end-to-end latency")
+	fs.Float64Var(&c.skipSec, "skip", 0, "paced: drop e2e samples that arrive in the first N seconds (startup transient)")
 	fs.IntVar(&c.pool, "pool", 64, "per-worker pool (A); 0 = unlimited")
 	fs.BoolVar(&c.keep, "keep", false, "keep data dir")
 	fs.Parse(args)
@@ -649,7 +660,7 @@ func modesRun(args []string) {
 		return
 	}
 	ticks := genTicks(c.syms, c.ticks, c.dist)
-	wcfg := wcfg{batch: c.batch, flush: time.Duration(c.flushMS) * time.Millisecond, pool: c.pool, tuned: c.mode == "A-tuned" || c.mode == "A-ready", cacheKB: c.cacheKB, dir: c.dir, names: names}
+	wcfg := wcfg{batch: c.batch, flush: time.Duration(c.flushMS) * time.Millisecond, pool: c.pool, tuned: c.mode == "A-tuned" || c.mode == "A-ready" || c.mode == "A-hacc", acc: c.mode == "A-hacc", minB: c.minBatch, cacheKB: c.cacheKB, dir: c.dir, names: names}
 	if wcfg.pool == 0 {
 		wcfg.pool = 1 << 30
 	}
@@ -761,6 +772,7 @@ func modesRun(args []string) {
 	t0 := time.Now()
 	lat, sizes, opens, err := run(func(put func(mtick)) {
 		t0 := time.Now()
+		gSkipUntil.Store(t0.UnixNano() + int64(c.skipSec*1e9))
 		for i, t := range ticks {
 			if c.rate > 0 {
 				if i%64 == 0 { // pace in small groups: sleep when far ahead, spin when close

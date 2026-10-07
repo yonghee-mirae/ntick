@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Write-path comparison of three storage layouts (docs/perf-storage-modes.md).
-# Usage: scripts/bench_modes.sh MATRIX   (matrix = a | b | c | skew | ready | paced | sat | read | all)
+# Usage: scripts/bench_modes.sh MATRIX   (matrix = a | b | c | skew | ready | paced | sat | hacc | hsat | tail | read | all)
 # Env: WORK (scratch dir, never inside the repo), REPS (default 3), TICKS (default 1000000)
 # Output: one "LABEL RESULT ..." line per run on stdout. Aggregate with scripts/bench_modes_sum.py.
 set -uo pipefail
@@ -70,6 +70,31 @@ case ${1:-all} in
      for i in 1 2; do
        run "sat-R1" -mode A-ready -syms 100 -ticks $TICKS -phase steady -dist uniform $A_TUNED -minbatch 1
        for f in 10 20 50; do run "sat-R200-T$f" -mode A-ready -syms 100 -ticks $TICKS -phase steady -dist uniform $A_TUNED -minbatch 200 -flush $f; done
+     done ;;
+  hacc) # hash+per-symbol accumulation vs global-batch hash vs ready queue (paced, startup transient skipped)
+     for cell in "100 110000" "100 360000" "500 50000" "500 170000"; do set -- $cell
+       s=$1 r=$2; t=$((r * 8)); c="-syms $s -ticks $t -rate $r -skip 2 -phase steady -dist zipf $A_TUNED"
+       run "H-f50-$s-$r" -mode A-tuned $c -flush 50
+       run "H-f10-$s-$r" -mode A-tuned $c -flush 10
+       run "HACC200-T10-$s-$r" -mode A-hacc $c -minbatch 200 -flush 10
+       run "HACC200-T50-$s-$r" -mode A-hacc $c -minbatch 200 -flush 50
+       run "R200-T10-$s-$r" -mode A-ready $c -minbatch 200 -flush 10
+       run "R200-T50-$s-$r" -mode A-ready $c -minbatch 200 -flush 50
+     done ;;
+  hsat) # unpaced capacity: hash vs hash+accumulation vs ready
+     for di in uniform zipf; do for s in 100 500; do c="-syms $s -ticks $TICKS -phase steady -dist $di $A_TUNED"
+       run "H-$di-$s" -mode A-tuned $c
+       run "HACC200-T20-$di-$s" -mode A-hacc $c -minbatch 200 -flush 20
+       run "R200-T20-$di-$s" -mode A-ready $c -minbatch 200 -flush 20
+     done; done ;;
+  tail) # p99 diagnosis: startup transient, WAL checkpoint, GC, fsync (12 s runs, R200-T10)
+     for cell in "100 110000" "500 50000"; do set -- $cell
+       s=$1 r=$2; t=$((r * 12)); c="-mode A-ready -minbatch 200 -flush 10 -syms $s -ticks $t -rate $r -phase steady -dist zipf $A_TUNED"
+       run "tail-base-skip0-$s" $c -skip 0
+       run "tail-base-skip4-$s" $c -skip 4
+       (export NTICK_XPRAGMA="wal_autocheckpoint(0)"; run "tail-nockpt-skip4-$s" $c -skip 4)
+       (export NTICK_XPRAGMA="synchronous(OFF)"; run "tail-syncoff-skip4-$s" $c -skip 4)
+       (export GOGC=off; run "tail-gcoff-skip4-$s" $c -skip 4)
      done ;;
   read) # same data (100 symbols, 5M ticks): A layout vs B layout, one symbol, warm
      rm -rf "$WORK/dsA" "$WORK/dsB"
